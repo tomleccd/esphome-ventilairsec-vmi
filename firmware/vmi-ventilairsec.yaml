@@ -1,0 +1,805 @@
+# =============================================================================================
+# Ventilairsec VMI Pulse'R (Cube / Urban) — radio bridge for Home Assistant
+# ESP32-S3 + CC1101 868 MHz, ESPHome 2026.10 or newer (native cc1101 component).
+#
+# Independent project, not affiliated with Ventilairsec. Use at your own risk.
+# See README.md for wiring and set-up, PROTOCOL.md for the radio protocol.
+#
+# The ESP does not know your installation at first. Turn on "Apprentissage telecommande",
+# then use your remote as described in the README: the ESP learns the identifier of your
+# remote and the frames it needs. Nothing is sent before that.
+# =============================================================================================
+
+substitutions:
+  name: vmi
+  friendly_name: VMI
+  refresh_interval: 1min       # how often the VMI is asked for its state
+  # CC1101 wiring
+  pin_sck: GPIO12
+  pin_mosi: GPIO6
+  pin_miso: GPIO13
+  pin_cs: GPIO10
+  pin_gdo0: GPIO4
+  frequency: 868.04MHz         # adjust if your module is off-frequency (see README)
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  includes:
+    - vmi_rf.h
+  on_boot:
+    priority: -100
+    then:
+      - lambda: |-
+          id(cur_speed) = id(manual_speed);
+          id(vmi_pilot).publish_state(id(cur_auto) ? "Automatique (la VMI ajuste)" : "Manuel (vitesse fixe)");
+          id(publish_learning).execute();
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret vmi_api_key
+
+ota:
+  - platform: esphome
+    password: !secret vmi_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+spi:
+  clk_pin: ${pin_sck}
+  mosi_pin: ${pin_mosi}
+  miso_pin: ${pin_miso}
+
+globals:
+  # ---- learned from the remote (kept across reboots) ----
+  - id: vmi_addr             # identifier of the remote/VMI pair, -1 = not learned
+    type: int
+    restore_value: true
+    initial_value: '-1'
+  - id: l_hello              # short frames, 4 data bytes, 0 = not learned
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: l_req_a              # asks for the page boost / vacances
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: l_req_b              # asks for the page filter / surventilation / turbochauffe
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: l_req_c              # asks for the page manual / automatic
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
+  - id: ref_frame            # last speed/heating command from the remote, 0 = not learned
+    type: uint64_t
+    restore_value: true
+    initial_value: '0'
+  - id: ref_speed
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: ref_heat
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: l_mode               # mode command with every mode off, 0 = not learned
+    type: uint64_t
+    restore_value: true
+    initial_value: '0'
+  - id: l_tmax               # max temperature command set to 32 C, 0 = not learned
+    type: uint64_t
+    restore_value: true
+    initial_value: '0'
+
+  # ---- wanted state ----
+  - id: cur_speed            # 1..10, used for the next command
+    type: int
+    initial_value: '5'
+  - id: manual_speed         # last speed seen or set while in manual
+    type: int
+    restore_value: true
+    initial_value: '5'
+  - id: cur_heat             # 0 off, 1 = 12 C, 2 = 15 C, 3 = 18 C
+    type: int
+    initial_value: '0'
+  - id: cur_auto             # false = manual, true = automatic
+    type: bool
+    restore_value: true
+    initial_value: 'false'
+  - id: want_boost
+    type: bool
+    initial_value: 'false'
+  - id: want_vacances
+    type: bool
+    initial_value: 'false'
+  - id: want_survent
+    type: bool
+    initial_value: 'false'
+  - id: want_turbo
+    type: bool
+    initial_value: 'false'
+  - id: want_tmax
+    type: int
+    initial_value: '32'
+
+  # ---- state reported by the VMI ----
+  - id: mode_a               # -1 unknown, 0 none, 1 boost, 2 vacances
+    type: int
+    initial_value: '-1'
+  - id: rep_survent
+    type: bool
+    initial_value: 'false'
+  - id: rep_turbo
+    type: bool
+    initial_value: 'false'
+
+  # ---- resend logic ----
+  - id: ack_cmd
+    type: bool
+    initial_value: 'false'
+  - id: ack_mode
+    type: bool
+    initial_value: 'false'
+  - id: cmd_sent
+    type: bool
+    initial_value: 'false'
+  - id: tries
+    type: int
+    initial_value: '0'
+  - id: req_speed
+    type: int
+    initial_value: '0'
+  - id: req_heat
+    type: int
+    initial_value: '0'
+  - id: req_auto
+    type: bool
+    initial_value: 'false'
+
+cc1101:
+  id: vmi_radio
+  cs_pin: ${pin_cs}
+  gdo0_pin: ${pin_gdo0}
+  frequency: ${frequency}
+  modulation_type: 2-FSK
+  fsk_deviation: 100kHz
+  symbol_rate: 9600
+  filter_bandwidth: 406kHz
+  output_power: 10
+  packet_mode: true
+  packet_length: 16
+  crc_enable: false
+  whitening: false
+  sync_mode: 16/16
+  sync1: 0x2D
+  sync0: 0xD4
+  on_packet:
+    then:
+      - lambda: |-
+          if (!vmi::block_ok(x, 0)) return;                 // noise
+          const bool is_long = vmi::block_ok(x, 7);
+          uint8_t d[4], e[4] = {0, 0, 0, 0};
+          vmi::decode(&x[0], d);
+          if (is_long) vmi::decode(&x[7], e);
+          const int addr = (d[2] << 8) | d[3];
+          const int spd = d[1] >> 4, typ = d[1] & 0x0F;
+
+          // ---- address: learned from the "hello" the remote sends when it wakes up ----
+          if (!is_long && d[1] == 0x06 && id(learn_switch).state && addr != id(vmi_addr)) {
+            id(vmi_addr) = addr;
+            id(l_hello) = 0; id(l_req_a) = 0; id(l_req_b) = 0; id(l_req_c) = 0;
+            id(ref_frame) = 0; id(l_mode) = 0; id(l_tmax) = 0;
+            ESP_LOGI("vmi", "Telecommande apprise : identifiant %04X", addr);
+          }
+          if (id(vmi_addr) < 0 || addr != id(vmi_addr)) {
+            ESP_LOGV("vmi", "Trame d'une autre installation ignoree (%04X)", addr);
+            return;
+          }
+
+          static const char *const HEAT[4] = {"Arret", "12 C", "15 C", "18 C"};
+          static float last_num[12] = {NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN, NAN};
+          auto pub_num = [&](int slot, sensor::Sensor *t, float v) {
+            if (!(last_num[slot] == v)) { last_num[slot] = v; t->publish_state(v); }
+          };
+          static std::string last_raw[4];
+          auto pub_raw = [&](int slot, text_sensor::TextSensor *t) {
+            char buf[40];
+            snprintf(buf, sizeof(buf), "%02X %02X %02X %02X | %02X %02X %02X %02X",
+                     d[0], d[1], d[2], d[3], e[0], e[1], e[2], e[3]);
+            if (last_raw[slot] != buf) { last_raw[slot] = buf; t->publish_state(buf); }
+          };
+          bool learned = false;
+
+          // ================= short frames (from the remote) =================
+          if (!is_long) {
+            const uint32_t raw = vmi::pack4(&x[0]);
+            uint32_t *slot = nullptr;
+            if (d[1] == 0x06) slot = &id(l_hello);
+            else if (d[1] == 0x08) slot = &id(l_req_a);
+            else if (d[1] == 0x04) slot = &id(l_req_b);
+            else if (d[1] == 0x34) slot = &id(l_req_c);
+            if (slot != nullptr && *slot != raw) { *slot = raw; learned = true; }
+            ESP_LOGD("vmi", "RX court %02X (%.0f dBm)", d[1], rssi);
+            if (learned) id(publish_learning).execute();
+            return;
+          }
+
+          // ================= long frames =================
+          if (typ == 0xD) {
+            // VMI status: [humidity %] [internal temp (T+40)*2] [heating setpoint C] [flags]
+            const int setp = e[2];
+            int heat = 0;
+            if (setp == 12) heat = 1; else if (setp == 15) heat = 2; else if (setp == 18) heat = 3;
+            ESP_LOGI("vmi", "RX etat : vitesse %d, consigne %d C, %.1f C, %d %%", spd, setp, e[1] / 2.0f - 40.0f, e[0]);
+            pub_raw(0, id(vmi_raw_status));
+            pub_num(0, id(vmi_real_speed), spd);
+            pub_num(1, id(vmi_temp), e[1] / 2.0f - 40.0f);
+            pub_num(2, id(vmi_hum), e[0]);
+            static int last_setp = -1;
+            if (setp != last_setp) {
+              last_setp = setp;
+              char hb[24];
+              if (setp == 0) snprintf(hb, sizeof(hb), "Arret");
+              else if (setp == 4) snprintf(hb, sizeof(hb), "4 C (hors-gel)");
+              else snprintf(hb, sizeof(hb), "%d C", setp);
+              id(vmi_real_heat).publish_state(hb);
+            }
+            if (spd < 1 || spd > 10) return;
+            if (id(send_command).is_running() && !id(cmd_sent)) return;   // our command is on its way
+            id(ack_cmd) = true;
+            if (setp != 4) { id(cur_heat) = heat; id(vmi_heat).publish_state(HEAT[heat]); }
+            if (!id(cur_auto)) {
+              id(cur_speed) = spd;
+              id(manual_speed) = spd;
+              id(vmi_speed).publish_state(spd);
+            }
+            return;
+          }
+
+          if (typ == 0xE) {
+            // Page boost / vacances: [1 vacances, 2 boost] [heating power] [operating days, 2 bytes]
+            const int m = (e[0] == 2) ? 1 : (e[0] == 1 ? 2 : 0);
+            id(mode_a) = m;
+            id(ack_mode) = true;
+            if (!id(send_mode).is_running()) { id(want_boost) = (m == 1); id(want_vacances) = (m == 2); }
+            pub_raw(1, id(vmi_raw_page_a));
+            pub_num(3, id(vmi_heat_power), e[1]);
+            pub_num(4, id(vmi_run_days), (e[2] << 8) | e[3]);
+            id(publish_modes).execute();
+            return;
+          }
+
+          if (typ == 0xF) {
+            // Page filter: [00] [filter days] [max temperature C] [02 + 10 surventilation + 20 turbochauffe]
+            const bool sv = (e[3] & 0x10) != 0, tc = (e[3] & 0x20) != 0;
+            id(rep_survent) = sv;
+            id(rep_turbo) = tc;
+            id(ack_mode) = true;
+            if (!id(send_mode).is_running()) { id(want_survent) = sv; id(want_turbo) = tc; }
+            pub_raw(2, id(vmi_raw_page_b));
+            pub_num(5, id(vmi_filter_days), e[1]);
+            pub_num(6, id(vmi_tmax_rep), e[2]);
+            if (!id(send_tmax).is_running() && e[2] >= 20 && e[2] <= 45 && id(vmi_tmax).state != e[2])
+              id(vmi_tmax).publish_state(e[2]);
+            id(publish_modes).execute();
+            return;
+          }
+
+          if (typ == 0xA && spd == 0xF) {
+            // Versions page: [VH] [VS] [nominal speed] [00]
+            ESP_LOGI("vmi", "RX versions : VH %d.%d, VS %d.%d, vitesse nominale %d",
+                     e[0] >> 4, e[0] & 15, e[1] >> 4, e[1] & 15, e[2]);
+            return;
+          }
+
+          if (typ == 0xA) {
+            // Page manual / automatic: [00 manual, 09 automatic] [state code, 64 = normal] [unknown] [01]
+            const bool is_auto = e[0] == 0x09;
+            pub_raw(3, id(vmi_raw_page_c));
+            pub_num(7, id(vmi_state_code), e[1]);
+            pub_num(8, id(vmi_unknown_c), e[2]);
+            static int last_auto = -1;
+            if ((int) is_auto != last_auto) {
+              last_auto = (int) is_auto;
+              id(vmi_real_pilot).publish_state(is_auto ? "Automatique" : "Manuel");
+            }
+            if (id(send_command).is_running()) return;
+            if (is_auto != id(cur_auto)) {
+              id(cur_auto) = is_auto;
+              if (!is_auto) id(cur_speed) = id(manual_speed);
+              id(vmi_pilot).publish_state(is_auto ? "Automatique (la VMI ajuste)" : "Manuel (vitesse fixe)");
+            }
+            return;
+          }
+
+          if (typ == 0x0) {
+            // Speed/heating command from the remote:
+            // [room temp (T+40)*2] [room humidity %] [00] [heating 0/2/5/8 << 4 | 2 manual, A automatic]
+            const int flags = e[3] & 0x0F;
+            if (flags != 0x02 && flags != 0x0A) {
+              ESP_LOGI("vmi", "RX commande telecommande (variante inconnue %02X), ignoree", e[3]);
+              return;
+            }
+            const bool is_auto = flags == 0x0A;
+            const int hc = e[3] >> 4;
+            const int heat = hc == 2 ? 1 : (hc == 5 ? 2 : (hc == 8 ? 3 : 0));
+            ESP_LOGI("vmi", "RX commande telecommande : vitesse %d, chauffage %s, %s", spd, HEAT[heat],
+                     is_auto ? "automatique" : "manuel");
+            pub_num(9, id(remote_temp), e[0] / 2.0f - 40.0f);
+            if (e[1] > 0) pub_num(10, id(remote_hum), e[1]);
+            if (is_auto != id(cur_auto)) {
+              id(cur_auto) = is_auto;
+              id(vmi_pilot).publish_state(is_auto ? "Automatique (la VMI ajuste)" : "Manuel (vitesse fixe)");
+            }
+            if (spd >= 1 && spd <= 10) {
+              const uint64_t f = vmi::pack8(&x[0], &x[7]);
+              if (f != id(ref_frame)) {
+                if (id(ref_frame) == 0) learned = true;
+                id(ref_frame) = f; id(ref_speed) = spd; id(ref_heat) = heat;
+              }
+            }
+            if (learned) id(publish_learning).execute();
+            return;
+          }
+
+          if (typ == 0x9 && spd == 0) {
+            // Mode command from the remote: [00] [00] [00] [08 + flags]. Stored with every mode off.
+            uint8_t f[8];
+            vmi::unpack8(vmi::pack8(&x[0], &x[7]), f);
+            if (e[3] & vmi::F_BOOST) vmi::xor8(f, vmi::M_BOOST);
+            if (e[3] & vmi::F_VACANCES) vmi::xor8(f, vmi::M_VACANCES);
+            if (e[3] & vmi::F_SURVENT) vmi::xor8(f, vmi::M_SURVENT);
+            if (e[3] & vmi::F_TURBO) vmi::xor8(f, vmi::M_TURBO);
+            const uint64_t v = vmi::pack8(f, f + 4);
+            if (v != id(l_mode)) { id(l_mode) = v; id(publish_learning).execute(); }
+            ESP_LOGI("vmi", "RX commande de mode (telecommande) %02X", e[3]);
+            return;
+          }
+
+          if (typ == 0x3 && spd == 0) {
+            // Max temperature command from the remote: [00] [04] [00] [degrees]. Stored as 32 C.
+            const int t = e[3];
+            if (t < 0x10 || t > 0x2F) return;
+            uint8_t f[8];
+            vmi::unpack8(vmi::pack8(&x[0], &x[7]), f);
+            vmi::tmax_flip(f, t);
+            const uint64_t v = vmi::pack8(f, f + 4);
+            if (v != id(l_tmax)) { id(l_tmax) = v; id(publish_learning).execute(); }
+            ESP_LOGI("vmi", "RX temperature max (telecommande) %d C", t);
+            return;
+          }
+
+          ESP_LOGD("vmi", "RX trame inconnue  %02X %02X %02X %02X | %02X %02X %02X %02X",
+                   d[0], d[1], d[2], d[3], e[0], e[1], e[2], e[3]);
+
+script:
+  - id: publish_learning
+    then:
+      - lambda: |-
+          if (id(vmi_addr) < 0) { id(learn_state).publish_state("Pas appris : activer l'apprentissage"); return; }
+          std::string s;
+          auto add = [&](bool ok, const char *n) { if (!ok) s += s.empty() ? n : std::string(", ") + n; };
+          add(id(l_hello) != 0, "reveil");
+          add(id(l_req_a) && id(l_req_b) && id(l_req_c), "pages");
+          add(id(ref_frame) != 0, "vitesse");
+          add(id(l_mode) != 0, "modes");
+          add(id(l_tmax) != 0, "temperature max");
+          id(learn_state).publish_state(s.empty() ? std::string("Complet") : "Manque : " + s);
+
+  - id: send_short
+    mode: queued
+    parameters:
+      raw: uint32_t
+    then:
+      - if:
+          condition:
+            lambda: 'return raw != 0;'
+          then:
+            - cc1101.send_packet:
+                data: !lambda |-
+                  uint8_t f[4];
+                  vmi::unpack4(raw, f);
+                  return vmi::build(f, 1);
+
+  - id: refresh_state
+    mode: restart
+    then:
+      - script.execute: { id: send_short, raw: !lambda 'return id(l_hello);' }
+      - delay: 300ms
+      - script.execute: { id: send_short, raw: !lambda 'return id(l_req_a);' }
+      - delay: 300ms
+      - script.execute: { id: send_short, raw: !lambda 'return id(l_req_b);' }
+      - delay: 300ms
+      - script.execute: { id: send_short, raw: !lambda 'return id(l_req_c);' }
+
+  - id: publish_modes
+    then:
+      - lambda: |-
+          std::string s;
+          if (id(mode_a) == 1) s = "Boost";
+          else if (id(mode_a) == 2) s = "Vacances";
+          if (id(rep_survent)) s += s.empty() ? "Surventilation" : " + Surventilation";
+          if (id(rep_turbo)) s += s.empty() ? "Turbochauffe" : " + Turbochauffe";
+          if (s.empty()) s = "Aucun";
+          id(vmi_modes).publish_state(s);
+
+  # ---- speed / heating / manual-automatic ----
+  - id: send_command
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(ref_frame) == 0 || id(l_hello) == 0;'
+          then:
+            - lambda: 'id(vmi_last_cmd).publish_state("Pas encore appris (vitesse)");'
+            - script.stop: send_command
+      - lambda: |-
+          id(tries) = 0; id(ack_cmd) = false; id(cmd_sent) = false;
+          id(req_speed) = id(cur_speed); id(req_heat) = id(cur_heat); id(req_auto) = id(cur_auto);
+      - script.execute: { id: send_short, raw: !lambda 'return id(l_hello);' }
+      - delay: 1s
+      - while:
+          condition:
+            lambda: 'return !id(ack_cmd) && id(tries) < 3;'
+          then:
+            - lambda: 'id(tries)++; id(ack_cmd) = false; id(cmd_sent) = true;'
+            - cc1101.send_packet:
+                data: !lambda |-
+                  uint8_t f[8];
+                  vmi::unpack8(id(ref_frame), f);
+                  int speed = id(cur_speed); if (speed < 1) speed = 1; if (speed > 10) speed = 10;
+                  int heat = id(cur_heat) & 3, rheat = id(ref_heat) & 3;
+                  const int diff = (speed ^ id(ref_speed)) & 0x0F;
+                  for (int b = 0; b < 4; b++)
+                    if (diff & (1 << b)) for (int i = 0; i < 4; i++) f[i] ^= vmi::SPEED[b][i];
+                  for (int i = 0; i < 4; i++) {
+                    f[i] ^= vmi::HEAT1[rheat][i] ^ vmi::HEAT1[heat][i];
+                    f[4 + i] ^= vmi::HEAT2[rheat][i] ^ vmi::HEAT2[heat][i];
+                  }
+                  const bool ref_auto = !(f[4] & 0x80);
+                  if (ref_auto != id(cur_auto))
+                    for (int i = 0; i < 4; i++) { f[i] ^= vmi::AUTO1[i]; f[4 + i] ^= vmi::AUTO2[i]; }
+                  ESP_LOGI("vmi", "TX commande : vitesse %d, chauffage %d, %s", speed, heat,
+                           id(cur_auto) ? "automatique" : "manuel");
+                  return vmi::build(f, 2);
+            - delay: 500ms
+      - lambda: |-
+          static const char *const HEAT[4] = {"Arret", "12 C", "15 C", "18 C"};
+          char buf[96];
+          snprintf(buf, sizeof(buf), "Vitesse %d, chauffage %s, %s : %s", id(req_speed), HEAT[id(req_heat) & 3],
+                   id(req_auto) ? "automatique" : "manuel", id(ack_cmd) ? "acceptee" : "SANS REPONSE");
+          id(vmi_last_cmd).publish_state(buf);
+      - delay: 1s
+      - script.execute: refresh_state
+
+  # ---- boost / vacances / surventilation / turbochauffe ----
+  - id: send_mode
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(l_mode) == 0;'
+          then:
+            - lambda: 'id(vmi_last_cmd).publish_state("Pas encore appris (modes)");'
+            - script.stop: send_mode
+      - lambda: 'id(tries) = 0; id(ack_mode) = false;'
+      - while:
+          condition:
+            lambda: 'return !id(ack_mode) && id(tries) < 3;'
+          then:
+            - lambda: 'id(tries)++;'
+            - cc1101.send_packet:
+                data: !lambda |-
+                  uint8_t f[8];
+                  vmi::unpack8(id(l_mode), f);
+                  if (id(want_boost)) vmi::xor8(f, vmi::M_BOOST);
+                  else if (id(want_vacances)) vmi::xor8(f, vmi::M_VACANCES);
+                  if (id(want_survent)) vmi::xor8(f, vmi::M_SURVENT);
+                  if (id(want_turbo)) vmi::xor8(f, vmi::M_TURBO);
+                  ESP_LOGI("vmi", "TX modes : boost %d, vacances %d, surventilation %d, turbochauffe %d",
+                           (int) id(want_boost), (int) (id(want_vacances) && !id(want_boost)),
+                           (int) id(want_survent), (int) id(want_turbo));
+                  return vmi::build(f, 2);
+            - delay: 500ms
+      - lambda: |-
+          std::string m;
+          if (id(want_boost)) m = "boost";
+          else if (id(want_vacances)) m = "vacances";
+          if (id(want_survent)) m += m.empty() ? "surventilation" : " + surventilation";
+          if (id(want_turbo)) m += m.empty() ? "turbochauffe" : " + turbochauffe";
+          if (m.empty()) m = "aucun";
+          id(vmi_last_cmd).publish_state("Modes " + m + (id(ack_mode) ? " : acceptee" : " : SANS REPONSE"));
+      - delay: 1s
+      - script.execute: refresh_state
+
+  # ---- maximum temperature ----
+  - id: send_tmax
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(l_tmax) == 0;'
+          then:
+            - lambda: 'id(vmi_last_cmd).publish_state("Pas encore appris (temperature max)");'
+            - script.stop: send_tmax
+      - lambda: 'id(tries) = 0; id(ack_mode) = false;'
+      - while:
+          condition:
+            lambda: 'return !id(ack_mode) && id(tries) < 3;'
+          then:
+            - lambda: 'id(tries)++;'
+            - cc1101.send_packet:
+                data: !lambda |-
+                  uint8_t f[8];
+                  vmi::unpack8(id(l_tmax), f);
+                  int v = id(want_tmax); if (v < 20) v = 20; if (v > 45) v = 45;
+                  vmi::tmax_flip(f, v);
+                  ESP_LOGI("vmi", "TX temperature max %d C", v);
+                  return vmi::build(f, 2);
+            - delay: 500ms
+      - lambda: |-
+          char buf[64];
+          snprintf(buf, sizeof(buf), "Temperature max %d C : %s", id(want_tmax), id(ack_mode) ? "acceptee" : "SANS REPONSE");
+          id(vmi_last_cmd).publish_state(buf);
+      - delay: 1s
+      - script.execute: refresh_state
+
+interval:
+  - interval: ${refresh_interval}
+    startup_delay: 30s
+    then:
+      - if:
+          condition:
+            not:
+              or:
+                - script.is_running: send_command
+                - script.is_running: send_mode
+                - script.is_running: send_tmax
+          then:
+            - script.execute: refresh_state
+
+number:
+  - platform: template
+    id: vmi_speed
+    name: "Vitesse VMI"
+    icon: mdi:fan
+    min_value: 1
+    max_value: 10
+    step: 1
+    mode: slider
+    optimistic: true
+    set_action:
+      - lambda: |-
+          id(cur_speed) = (int) x;
+          id(manual_speed) = (int) x;
+          if (id(cur_auto)) { id(cur_auto) = false; id(vmi_pilot).publish_state("Manuel (vitesse fixe)"); }
+      - script.execute: send_command
+
+  - platform: template
+    id: vmi_tmax
+    name: "Temperature max VMI"
+    icon: mdi:thermometer-alert
+    unit_of_measurement: "°C"
+    min_value: 20
+    max_value: 45
+    step: 1
+    mode: box
+    optimistic: true
+    set_action:
+      - lambda: 'id(want_tmax) = (int) x;'
+      - script.execute: send_tmax
+
+select:
+  - platform: template
+    id: vmi_pilot
+    name: "Pilotage VMI"
+    icon: mdi:hand-back-right
+    optimistic: true
+    options:
+      - "Manuel (vitesse fixe)"
+      - "Automatique (la VMI ajuste)"
+    set_action:
+      - lambda: |-
+          const bool was_auto = id(cur_auto);
+          id(cur_auto) = std::string(x.c_str()).rfind("Automatique", 0) == 0;
+          if (was_auto && !id(cur_auto)) id(cur_speed) = id(manual_speed);
+      - script.execute: send_command
+
+  - platform: template
+    id: vmi_heat
+    name: "Chauffage VMI"
+    icon: mdi:radiator
+    optimistic: true
+    options: ["Arret", "12 C", "15 C", "18 C"]
+    set_action:
+      - lambda: |-
+          std::string v(x.c_str());
+          id(cur_heat) = v == "12 C" ? 1 : (v == "15 C" ? 2 : (v == "18 C" ? 3 : 0));
+      - script.execute: send_command
+
+switch:
+  - platform: template
+    name: "Boost 30 min"
+    icon: mdi:fan-plus
+    lambda: 'return id(mode_a) == 1;'
+    turn_on_action:
+      - lambda: 'id(want_boost) = true; id(want_vacances) = false;'
+      - script.execute: send_mode
+    turn_off_action:
+      - lambda: 'id(want_boost) = false;'
+      - script.execute: send_mode
+
+  - platform: template
+    name: "Vacances (ventilation mini)"
+    icon: mdi:bag-suitcase
+    lambda: 'return id(mode_a) == 2;'
+    turn_on_action:
+      - lambda: 'id(want_vacances) = true; id(want_boost) = false;'
+      - script.execute: send_mode
+    turn_off_action:
+      - lambda: 'id(want_vacances) = false;'
+      - script.execute: send_mode
+
+  - platform: template
+    name: "Surventilation ete"
+    icon: mdi:snowflake
+    lambda: 'return id(rep_survent);'
+    turn_on_action:
+      - lambda: 'id(want_survent) = true;'
+      - script.execute: send_mode
+    turn_off_action:
+      - lambda: 'id(want_survent) = false;'
+      - script.execute: send_mode
+
+  - platform: template
+    name: "Turbochauffe hiver"
+    icon: mdi:white-balance-sunny
+    lambda: 'return id(rep_turbo);'
+    turn_on_action:
+      - lambda: 'id(want_turbo) = true;'
+      - script.execute: send_mode
+    turn_off_action:
+      - lambda: 'id(want_turbo) = false;'
+      - script.execute: send_mode
+
+  # Learning mode: switches itself off after 10 minutes.
+  - platform: template
+    id: learn_switch
+    name: "Apprentissage telecommande"
+    icon: mdi:school
+    entity_category: config
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - logger.log: { level: INFO, tag: vmi, format: "Apprentissage : reveillez la telecommande pres de l'ESP" }
+      - delay: 10min
+      - switch.turn_off: learn_switch
+
+sensor:
+  - platform: template
+    id: vmi_real_speed
+    name: "VMI vitesse reelle"
+    icon: mdi:fan
+    accuracy_decimals: 0
+  - platform: template
+    id: vmi_temp
+    name: "VMI temperature interne"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    id: vmi_hum
+    name: "VMI humidite interne"
+    unit_of_measurement: "%"
+    device_class: humidity
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    id: vmi_heat_power
+    name: "VMI puissance chauffage"
+    icon: mdi:heating-coil
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    id: vmi_filter_days
+    name: "VMI filtre jours"
+    icon: mdi:air-filter
+    unit_of_measurement: "j"
+    accuracy_decimals: 0
+  - platform: template
+    id: vmi_run_days
+    name: "VMI duree de fonctionnement"
+    icon: mdi:timer-outline
+    unit_of_measurement: "j"
+    accuracy_decimals: 0
+  - platform: template
+    id: vmi_tmax_rep
+    name: "VMI temperature max"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    accuracy_decimals: 0
+  - platform: template
+    id: remote_temp
+    name: "Telecommande temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    id: remote_hum
+    name: "Telecommande humidite"
+    unit_of_measurement: "%"
+    device_class: humidity
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    id: vmi_state_code
+    name: "VMI code etat"
+    entity_category: diagnostic
+    accuracy_decimals: 0
+  - platform: template
+    id: vmi_unknown_c
+    name: "VMI valeur inconnue"
+    entity_category: diagnostic
+    state_class: measurement
+    accuracy_decimals: 0
+
+text_sensor:
+  - platform: template
+    id: vmi_modes
+    name: "Modes actifs VMI"
+    icon: mdi:information-outline
+  - platform: template
+    id: vmi_real_heat
+    name: "VMI chauffage reel"
+    icon: mdi:radiator
+  - platform: template
+    id: vmi_real_pilot
+    name: "VMI pilotage reel"
+    icon: mdi:hand-back-right
+  - platform: template
+    id: vmi_last_cmd
+    name: "Derniere commande envoyee"
+    icon: mdi:send
+  - platform: template
+    id: learn_state
+    name: "Apprentissage etat"
+    icon: mdi:school
+    entity_category: diagnostic
+  # Decoded frames (block 1 | block 2), diagnostic only
+  - platform: template
+    id: vmi_raw_status
+    name: "VMI trame etat"
+    entity_category: diagnostic
+  - platform: template
+    id: vmi_raw_page_a
+    name: "VMI trame boost-vacances"
+    entity_category: diagnostic
+  - platform: template
+    id: vmi_raw_page_b
+    name: "VMI trame filtre"
+    entity_category: diagnostic
+  - platform: template
+    id: vmi_raw_page_c
+    name: "VMI trame pilotage"
+    entity_category: diagnostic
+
+button:
+  - platform: template
+    name: "Actualiser etat VMI"
+    icon: mdi:refresh
+    on_press:
+      - script.execute: refresh_state

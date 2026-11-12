@@ -24,7 +24,13 @@ ESP32 and a CC1101 868 MHz radio. The radio protocol is documented in [PROTOCOL.
 - Jours d'utilisation du filtre, durée de fonctionnement, température max
 - Code d'état (64 = normal), utile pour une alerte de défaut
 
-**Relevées sur la télécommande** (seulement quand elle est allumée) : température et humidité de la pièce.
+**Relevées sur la télécommande** : température et humidité de la pièce (à chaque appui et toutes les 10 minutes).
+
+**Remplacer la télécommande pour la température et l'humidité** (optionnel) : l'ESP peut envoyer
+à la VMI les mesures d'une sonde Home Assistant à la place de celles de la télécommande. Utile en
+pilotage automatique, quand la télécommande n'est pas dans la pièce de vie. Indiquez la sonde dans
+les substitutions `room_temp_entity` et `room_hum_entity`, puis activez l'interrupteur
+« Remplacer la telecommande (temp hum) ».
 
 ## Matériel
 
@@ -73,14 +79,15 @@ L'ESP ne lit et ne pilote que la VMI dont il a appris l'identifiant ; les trames
 - **Boost** : s'arrête seul après 30 minutes, comme depuis la télécommande.
 - **Fréquence** : si rien n'est reçu, votre module CC1101 est peut-être décalé. Ajustez
   `frequency` par pas de 20 kHz autour de 868,04 MHz.
-- **Mode automatique sans télécommande** : la VMI régule avec la température et l'humidité
-  envoyées par la télécommande. Télécommande éteinte, elle garde les dernières valeurs reçues.
+- **Mode automatique** : la VMI régule avec la température et l'humidité de la pièce. Sans sonde
+  Home Assistant, ce sont celles de la télécommande, là où elle est posée.
+- **Consommation** (mesurée sur une installation, ventilateur seul) : environ 22 W en vitesse 3,
+  32 W en 5, 38 W en 6, 41 W en 7.
 
 ## Limites connues
 
-- La somme de contrôle des trames n'est pas comprise : les commandes sont construites à partir
-  des trames apprises de votre télécommande (voir [PROTOCOL.md](PROTOCOL.md)). Elles ont été
-  validées sur une seule installation.
+- Les commandes sont construites à partir des trames apprises de votre télécommande et de tables
+  mesurées sur une seule installation (voir [PROTOCOL.md](PROTOCOL.md)).
 - Pas encore de remise à zéro du compteur de filtre, ni des indicateurs veille et été.
 
 Les retours sur d'autres installations (modèle, versions affichées dans le menu installateur,

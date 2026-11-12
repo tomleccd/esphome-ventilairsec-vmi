@@ -5,6 +5,9 @@
 # Independent project, not affiliated with Ventilairsec. Use at your own risk.
 # See README.md for wiring and set-up, PROTOCOL.md for the radio protocol.
 #
+# Optional: the ESP can send the temperature and humidity of a Home Assistant probe to the VMI
+# in place of the remote's (switch "Remplacer la telecommande (temp hum)", entities below).
+#
 # The ESP does not know your installation at first. Turn on "Apprentissage telecommande",
 # then use your remote as described in the README: the ESP learns the identifier of your
 # remote and the frames it needs. Nothing is sent before that.
@@ -21,6 +24,9 @@ substitutions:
   pin_cs: GPIO10
   pin_gdo0: GPIO4
   frequency: 868.04MHz         # adjust if your module is off-frequency (see README)
+  # Optional room probe sent to the VMI in place of the remote's measurements
+  room_temp_entity: sensor.room_temperature
+  room_hum_entity: sensor.room_humidity
 
 esphome:
   name: ${name}
@@ -152,6 +158,9 @@ globals:
   - id: ack_mode
     type: bool
     initial_value: 'false'
+  - id: ack_tmax
+    type: bool
+    initial_value: 'false'
   - id: cmd_sent
     type: bool
     initial_value: 'false'
@@ -167,6 +176,8 @@ globals:
   - id: req_auto
     type: bool
     initial_value: 'false'
+  - id: cmd_frame
+    type: std::vector<uint8_t>
 
 cc1101:
   id: vmi_radio
@@ -189,7 +200,9 @@ cc1101:
     then:
       - lambda: |-
           if (!vmi::block_ok(x, 0)) return;                 // noise
-          const bool is_long = vmi::block_ok(x, 7);
+          // A block made only of AA (trailer) or 00 also passes the parity check: not a block 2.
+          const bool is_long = vmi::block_ok(x, 7) &&
+              !(x[7] == x[8] && x[8] == x[9] && x[9] == x[10] && (x[7] == 0xAA || x[7] == 0x00));
           uint8_t d[4], e[4] = {0, 0, 0, 0};
           vmi::decode(&x[0], d);
           if (is_long) vmi::decode(&x[7], e);
@@ -213,7 +226,7 @@ cc1101:
           auto pub_num = [&](int slot, sensor::Sensor *t, float v) {
             if (!(last_num[slot] == v)) { last_num[slot] = v; t->publish_state(v); }
           };
-          static std::string last_raw[4];
+          static std::string last_raw[5];
           auto pub_raw = [&](int slot, text_sensor::TextSensor *t) {
             char buf[40];
             snprintf(buf, sizeof(buf), "%02X %02X %02X %02X | %02X %02X %02X %02X",
@@ -239,6 +252,18 @@ cc1101:
           // ================= long frames =================
           if (typ == 0xD) {
             // VMI status: [humidity %] [internal temp (T+40)*2] [heating setpoint C] [flags]
+            // Frames damaged by collisions can pass the parity check: a temperature jump of more
+            // than 5 C is only taken once a second frame confirms it.
+            {
+              static int last_traw = -1, pending_traw = -1;
+              if (last_traw >= 0 && abs(e[1] - last_traw) > 10 && e[1] != pending_traw) {
+                pending_traw = e[1];
+                ESP_LOGW("vmi", "Etat ignore (saut de temperature), a confirmer");
+                return;
+              }
+              pending_traw = -1;
+              last_traw = e[1];
+            }
             const int setp = e[2];
             int heat = 0;
             if (setp == 12) heat = 1; else if (setp == 15) heat = 2; else if (setp == 18) heat = 3;
@@ -257,7 +282,12 @@ cc1101:
               id(vmi_real_heat).publish_state(hb);
             }
             if (spd < 1 || spd > 10) return;
-            if (id(send_command).is_running() && !id(cmd_sent)) return;   // our command is on its way
+            // Our own command is being sent: only take the state once the VMI reports what was
+            // asked, otherwise the retry loop sends the command again.
+            if (id(send_command).is_running()) {
+              if (!id(cmd_sent)) return;
+              if (!(heat == id(req_heat) && (id(req_auto) || spd == id(req_speed)))) return;
+            }
             id(ack_cmd) = true;
             if (setp != 4) { id(cur_heat) = heat; id(vmi_heat).publish_state(HEAT[heat]); }
             if (!id(cur_auto)) {
@@ -291,6 +321,7 @@ cc1101:
             pub_raw(2, id(vmi_raw_page_b));
             pub_num(5, id(vmi_filter_days), e[1]);
             pub_num(6, id(vmi_tmax_rep), e[2]);
+            if (e[2] == id(want_tmax)) id(ack_tmax) = true;
             if (!id(send_tmax).is_running() && e[2] >= 20 && e[2] <= 45 && id(vmi_tmax).state != e[2])
               id(vmi_tmax).publish_state(e[2]);
             id(publish_modes).execute();
@@ -306,10 +337,10 @@ cc1101:
 
           if (typ == 0xA) {
             // Page manual / automatic: [00 manual, 09 automatic] [state code, 64 = normal] [unknown] [01]
-            const bool is_auto = e[0] == 0x09;
+            const bool is_auto = (e[0] & 0x08) != 0;
             pub_raw(3, id(vmi_raw_page_c));
             pub_num(7, id(vmi_state_code), e[1]);
-            pub_num(8, id(vmi_unknown_c), e[2]);
+            pub_num(8, id(vmi_unknown_c), e[2] / 2.0f - 40.0f);
             static int last_auto = -1;
             if ((int) is_auto != last_auto) {
               last_auto = (int) is_auto;
@@ -326,13 +357,14 @@ cc1101:
 
           if (typ == 0x0) {
             // Speed/heating command from the remote:
-            // [room temp (T+40)*2] [room humidity %] [00] [heating 0/2/5/8 << 4 | 2 manual, A automatic]
-            const int flags = e[3] & 0x0F;
-            if (flags != 0x02 && flags != 0x0A) {
-              ESP_LOGI("vmi", "RX commande telecommande (variante inconnue %02X), ignoree", e[3]);
+            // [room temp (T+40)*2] [room humidity %] [00]
+            // [heating 0/2/5/8 << 4 | 08 automatic | humidity level 1-4]
+            pub_raw(4, id(remote_raw));
+            if (e[1] == 0) {          // variant sent when leaving the installer menu
+              ESP_LOGI("vmi", "RX commande telecommande (variante humidite 0), ignoree");
               return;
             }
-            const bool is_auto = flags == 0x0A;
+            const bool is_auto = (e[3] & 0x08) != 0;
             const int hc = e[3] >> 4;
             const int heat = hc == 2 ? 1 : (hc == 5 ? 2 : (hc == 8 ? 3 : 0));
             ESP_LOGI("vmi", "RX commande telecommande : vitesse %d, chauffage %s, %s", spd, HEAT[heat],
@@ -455,34 +487,56 @@ script:
             lambda: 'return !id(ack_cmd) && id(tries) < 3;'
           then:
             - lambda: 'id(tries)++; id(ack_cmd) = false; id(cmd_sent) = true;'
+            - script.execute: build_command
             - cc1101.send_packet:
-                data: !lambda |-
-                  uint8_t f[8];
-                  vmi::unpack8(id(ref_frame), f);
-                  int speed = id(cur_speed); if (speed < 1) speed = 1; if (speed > 10) speed = 10;
-                  int heat = id(cur_heat) & 3, rheat = id(ref_heat) & 3;
-                  const int diff = (speed ^ id(ref_speed)) & 0x0F;
-                  for (int b = 0; b < 4; b++)
-                    if (diff & (1 << b)) for (int i = 0; i < 4; i++) f[i] ^= vmi::SPEED[b][i];
-                  for (int i = 0; i < 4; i++) {
-                    f[i] ^= vmi::HEAT1[rheat][i] ^ vmi::HEAT1[heat][i];
-                    f[4 + i] ^= vmi::HEAT2[rheat][i] ^ vmi::HEAT2[heat][i];
-                  }
-                  const bool ref_auto = !(f[4] & 0x80);
-                  if (ref_auto != id(cur_auto))
-                    for (int i = 0; i < 4; i++) { f[i] ^= vmi::AUTO1[i]; f[4 + i] ^= vmi::AUTO2[i]; }
-                  ESP_LOGI("vmi", "TX commande : vitesse %d, chauffage %d, %s", speed, heat,
-                           id(cur_auto) ? "automatique" : "manuel");
-                  return vmi::build(f, 2);
+                data: !lambda 'return id(cmd_frame);'
             - delay: 500ms
       - lambda: |-
           static const char *const HEAT[4] = {"Arret", "12 C", "15 C", "18 C"};
           char buf[96];
           snprintf(buf, sizeof(buf), "Vitesse %d, chauffage %s, %s : %s", id(req_speed), HEAT[id(req_heat) & 3],
-                   id(req_auto) ? "automatique" : "manuel", id(ack_cmd) ? "acceptee" : "SANS REPONSE");
+                   id(req_auto) ? "automatique" : "manuel", id(ack_cmd) ? "acceptee" : "NON CONFIRMEE");
           id(vmi_last_cmd).publish_state(buf);
       - delay: 1s
       - script.execute: refresh_state
+
+  # Builds the speed/heating command from the reference frame into cmd_frame.
+  - id: build_command
+    then:
+      - lambda: |-
+            uint8_t f[8];
+            vmi::unpack8(id(ref_frame), f);
+            int speed = id(cur_speed); if (speed < 1) speed = 1; if (speed > 10) speed = 10;
+            int heat = id(cur_heat) & 3, rheat = id(ref_heat) & 3;
+            const int diff = (speed ^ id(ref_speed)) & 0x0F;
+            for (int b = 0; b < 4; b++)
+              if (diff & (1 << b)) for (int i = 0; i < 4; i++) f[i] ^= vmi::SPEED[b][i];
+            for (int i = 0; i < 4; i++) {
+              f[i] ^= vmi::HEAT1[rheat][i] ^ vmi::HEAT1[heat][i];
+              f[4 + i] ^= vmi::HEAT2[rheat][i] ^ vmi::HEAT2[heat][i];
+            }
+            // Manual/automatic of the reference frame, from its decoded flags byte.
+            uint8_t rv[4];
+            vmi::decode(f + 4, rv);
+            const bool ref_auto = (rv[3] & 0x08) != 0;
+            if (ref_auto != id(cur_auto))
+              for (int i = 0; i < 4; i++) { f[i] ^= vmi::AUTO1[i]; f[4 + i] ^= vmi::AUTO2[i]; }
+            // Room temperature and humidity from the HA probe, in place of the remote's.
+            const float rt = id(room_temp).state, rh = id(room_hum).state;
+            if (id(replace_remote).state && !std::isnan(rt) && !std::isnan(rh)) {
+              if (vmi::set_room(f, rt, rh)) ESP_LOGI("vmi", "TX piece : %.1f C, %.0f %%", rt, rh);
+              else ESP_LOGW("vmi", "Trame de reference hors table : mesures de la telecommande gardees");
+            }
+            ESP_LOGI("vmi", "TX commande : vitesse %d, chauffage %d, %s", speed, heat,
+                     id(cur_auto) ? "automatique" : "manuel");
+            id(cmd_frame) = vmi::build(f, 2);
+
+  # Like the remote: the speed command alone (no hello), with the room temperature and humidity.
+  - id: send_room
+    then:
+      - script.execute: build_command
+      - cc1101.send_packet:
+          data: !lambda 'return id(cmd_frame);'
 
   # ---- boost / vacances / surventilation / turbochauffe ----
   - id: send_mode
@@ -534,10 +588,10 @@ script:
           then:
             - lambda: 'id(vmi_last_cmd).publish_state("Pas encore appris (temperature max)");'
             - script.stop: send_tmax
-      - lambda: 'id(tries) = 0; id(ack_mode) = false;'
+      - lambda: 'id(tries) = 0; id(ack_tmax) = false;'
       - while:
           condition:
-            lambda: 'return !id(ack_mode) && id(tries) < 3;'
+            lambda: 'return !id(ack_tmax) && id(tries) < 3;'
           then:
             - lambda: 'id(tries)++;'
             - cc1101.send_packet:
@@ -551,12 +605,29 @@ script:
             - delay: 500ms
       - lambda: |-
           char buf[64];
-          snprintf(buf, sizeof(buf), "Temperature max %d C : %s", id(want_tmax), id(ack_mode) ? "acceptee" : "SANS REPONSE");
+          snprintf(buf, sizeof(buf), "Temperature max %d C : %s", id(want_tmax), id(ack_tmax) ? "acceptee" : "NON CONFIRMEE");
           id(vmi_last_cmd).publish_state(buf);
       - delay: 1s
       - script.execute: refresh_state
 
 interval:
+  # Like the remote: the speed command with the room temperature and humidity every 10 minutes.
+  - interval: 10min
+    startup_delay: 90s
+    then:
+      - if:
+          condition:
+            and:
+              - switch.is_on: replace_remote
+              - lambda: 'return id(ref_frame) != 0 && id(l_hello) != 0;'
+              - not:
+                  or:
+                    - script.is_running: send_command
+                    - script.is_running: send_mode
+                    - script.is_running: send_tmax
+          then:
+            - logger.log: { level: INFO, tag: vmi, format: "Envoi periodique temperature/humidite de la piece" }
+            - script.execute: send_room
   - interval: ${refresh_interval}
     startup_delay: 30s
     then:
@@ -632,6 +703,7 @@ select:
 switch:
   - platform: template
     name: "Boost 30 min"
+    restore_mode: DISABLED       # do not send "all modes off" at every boot
     icon: mdi:fan-plus
     lambda: 'return id(mode_a) == 1;'
     turn_on_action:
@@ -643,6 +715,7 @@ switch:
 
   - platform: template
     name: "Vacances (ventilation mini)"
+    restore_mode: DISABLED       # do not send "all modes off" at every boot
     icon: mdi:bag-suitcase
     lambda: 'return id(mode_a) == 2;'
     turn_on_action:
@@ -654,6 +727,7 @@ switch:
 
   - platform: template
     name: "Surventilation ete"
+    restore_mode: DISABLED       # do not send "all modes off" at every boot
     icon: mdi:snowflake
     lambda: 'return id(rep_survent);'
     turn_on_action:
@@ -665,6 +739,7 @@ switch:
 
   - platform: template
     name: "Turbochauffe hiver"
+    restore_mode: DISABLED       # do not send "all modes off" at every boot
     icon: mdi:white-balance-sunny
     lambda: 'return id(rep_turbo);'
     turn_on_action:
@@ -673,6 +748,13 @@ switch:
     turn_off_action:
       - lambda: 'id(want_turbo) = false;'
       - script.execute: send_mode
+
+  - platform: template
+    id: replace_remote
+    name: "Remplacer la telecommande (temp hum)"
+    icon: mdi:remote-off
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
 
   # Learning mode: switches itself off after 10 minutes.
   - platform: template
@@ -688,6 +770,14 @@ switch:
       - switch.turn_off: learn_switch
 
 sensor:
+  - platform: homeassistant
+    id: room_temp
+    entity_id: ${room_temp_entity}
+    internal: true
+  - platform: homeassistant
+    id: room_hum
+    entity_id: ${room_hum_entity}
+    internal: true
   - platform: template
     id: vmi_real_speed
     name: "VMI vitesse reelle"
@@ -752,10 +842,12 @@ sensor:
     accuracy_decimals: 0
   - platform: template
     id: vmi_unknown_c
-    name: "VMI valeur inconnue"
+    name: "VMI temperature air entrant (supposee)"
+    unit_of_measurement: "°C"
+    device_class: temperature
     entity_category: diagnostic
     state_class: measurement
-    accuracy_decimals: 0
+    accuracy_decimals: 1
 
 text_sensor:
   - platform: template
@@ -795,6 +887,10 @@ text_sensor:
   - platform: template
     id: vmi_raw_page_c
     name: "VMI trame pilotage"
+    entity_category: diagnostic
+  - platform: template
+    id: remote_raw
+    name: "Telecommande trame"
     entity_category: diagnostic
 
 button:

@@ -1,6 +1,7 @@
 // Ventilairsec VMI Pulse'R — radio frame helpers for the ESPHome firmware.
 // See PROTOCOL.md for how the frames are built.
 #pragma once
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -15,6 +16,20 @@ inline int nib(const uint8_t *p, int pos) {
 // 4 data bytes of a block -> 4 decoded bytes (bit positions 0-1 -> byte 0, 2-3 -> byte 1, ...).
 inline void decode(const uint8_t *p, uint8_t *out) {
   for (int k = 0; k < 4; k++) out[k] = (uint8_t) ((nib(p, 2 * k) << 4) | nib(p, 2 * k + 1));
+}
+
+// Inverse of decode(): 4 decoded bytes -> 4 data bytes.
+inline void encode(const uint8_t *v, uint8_t *r) {
+  r[0] = r[1] = r[2] = r[3] = 0;
+  for (int k = 0; k < 4; k++) {
+    for (int h = 0; h < 2; h++) {
+      const int p = 2 * k + h;
+      const int n = h == 0 ? (v[k] >> 4) : (v[k] & 15);
+      const int c = n & 1, a = ((n >> 3) ^ (n >> 1) ^ c) & 1;
+      const int d = (a ^ (n >> 2) ^ c) & 1, b = ((n >> 1) ^ c ^ d) & 1;
+      r[0] |= a << p; r[1] |= b << p; r[2] |= c << p; r[3] |= d << p;
+    }
+  }
 }
 
 // Byte-wise Hamming(7,4) parity of the block starting at offset o.
@@ -97,6 +112,63 @@ inline void tmax_flip(uint8_t *f, int v) {
   if ((v >> 4) == 1) xor8(f, TMAX_HI);
   for (int b = 0; b < 4; b++)
     if (v & (1 << b)) xor8(f, TMAX_LO[b]);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Room temperature and humidity in the speed command (remote -> VMI).
+// The checksum (decoded byte 0 of block 1) is XOR-linear within a frame family: each changed bit
+// of the decoded data flips fixed bits of the decoded checksum. Table for the speed command,
+// worked out from 30+ frames of the remote (7.5 to 34 C, 33 to 97 %).
+// ---------------------------------------------------------------------------------------------
+static const uint8_t CK_TEMP[6] = {0x21, 0x42, 0x84, 0x08, 0x31, 0x62};  // temperature bits 0-5
+static const uint8_t CK_TEMP_HI = 0x4C;                                  // bits 6-7: 01 <-> 10
+static const uint8_t CK_HUM[6] = {0x31, 0x62, 0xC4, 0xA9, 0x73, 0xE6};   // humidity bits 0-5
+
+// Humidity level carried in bits 0-2 of the flags byte (as seen: 33-37 % -> 1, 43-59 % -> 2,
+// 60-69 % -> 3, 79 % and more -> 4).
+inline int hum_level(int h) { return h < 40 ? 1 : (h < 60 ? 2 : (h < 75 ? 3 : 4)); }
+
+// Checksum offset of (humidity bit 6, level), for the combinations seen; -1 = unknown.
+inline int ck_group(int h6, int lvl) {
+  if (h6 == 0 && lvl == 1) return 0xDC;
+  if (h6 == 0 && lvl == 2) return 0x00;
+  if (h6 == 0 && lvl == 3) return 0xB4;
+  if (h6 == 1 && lvl == 3) return 0x78;
+  if (h6 == 1 && lvl == 4) return 0x55;
+  return -1;
+}
+
+// Puts temperature t (C) and humidity h (%) into a speed command (raw data bytes, block 1 then
+// block 2). Returns false, frame unchanged, when the combination is outside the known table.
+inline bool set_room(uint8_t *f, float t, float h) {
+  uint8_t v1[4], v2[4];
+  decode(f, v1);
+  decode(f + 4, v2);
+  int T = (int) lroundf((t + 40.0f) * 2.0f);
+  if (T < 0x40) T = 0x40;
+  if (T > 0xBF) T = 0xBF;
+  int H = (int) lroundf(h);
+  if (H < 1) H = 1;
+  if (H > 100) H = 100;
+  const int lvl = hum_level(H);
+  const int T0 = v2[0], H0 = v2[1], L0 = v2[3] & 7;
+  const int g0 = ck_group((H0 >> 6) & 1, L0), g1 = ck_group((H >> 6) & 1, lvl);
+  const int t0 = (T0 >> 6) & 3;
+  if (g0 < 0 || g1 < 0 || !(t0 == 1 || t0 == 2) || H0 >= 0x80) return false;
+  int ck = 0;
+  for (int i = 0; i < 6; i++) {
+    if (((T0 ^ T) >> i) & 1) ck ^= CK_TEMP[i];
+    if (((H0 ^ H) >> i) & 1) ck ^= CK_HUM[i];
+  }
+  if (t0 != ((T >> 6) & 3)) ck ^= CK_TEMP_HI;
+  ck ^= g0 ^ g1;
+  v1[0] ^= ck;
+  v2[0] = T;
+  v2[1] = H;
+  v2[3] = (v2[3] & 0xF8) | lvl;
+  encode(v1, f);
+  encode(v2, f + 4);
+  return true;
 }
 
 }  // namespace vmi

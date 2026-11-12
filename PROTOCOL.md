@@ -46,7 +46,7 @@ Each block therefore carries 4 decoded bytes.
 
 | Decoded byte | Meaning                                                          |
 |--------------|------------------------------------------------------------------|
-| 0            | Checksum — **algorithm unknown** (not a plain sum, XOR or CRC-8)  |
+| 0            | Checksum, XOR-linear within a frame family (see below)            |
 | 1            | High nibble: speed (1..10) or sub-type. Low nibble: frame type   |
 | 2, 3         | Identifier of the remote/VMI pair (constant for an installation)  |
 
@@ -96,7 +96,7 @@ Each block therefore carries 4 decoded bytes.
 |------|-----------------------------------------------------------|
 | 0    | 00 manual, 09 automatic                                   |
 | 1    | State code: 64 normal, 67 after a failed heater self-test |
-| 2    | Unknown, moves with air temperature                       |
+| 2    | Probably the incoming fresh air temperature, `(T + 40) * 2` °C (about 3 °C above an outdoor probe) |
 | 3    | 01                                                        |
 
 Versions page (type A, sub-type F): `[VH] [VS] [nominal speed] [00]`, e.g. `20 27 01` = V2.0, V2.7, 1.
@@ -108,9 +108,14 @@ Versions page (type A, sub-type F): `[VH] [VS] [nominal speed] [00]`, e.g. `20 2
 | 0    | Room temperature measured by the remote, `(T + 40) * 2` °C     |
 | 1    | Room humidity measured by the remote, %                        |
 | 2    | 00                                                             |
-| 3    | High nibble heating 0 off, 2 = 12 °C, 5 = 15 °C, 8 = 18 °C; low nibble 2 manual, A automatic |
+| 3    | High nibble heating 0 off, 2 = 12 °C, 5 = 15 °C, 8 = 18 °C; bit 08 automatic; bits 0-2 humidity level |
 
-The remote sends it every 5 s while awake, and on every change. When it wakes up it sends its
+Humidity level as seen: 33-37 % → 1, 43-59 % → 2, 60-69 % → 3, 79 % and more → 4.
+A variant with humidity 0 and level 0 is sent when leaving the installer menu.
+
+The remote sends it every 5 s while awake, on every change, on its own every 10 minutes
+(no hello before it: the VMI then takes the room values but not the speed), and every 5 to
+20 s while its temperature changes fast. When it wakes up it sends its
 own manual/automatic setting, which overrides one set by another transmitter.
 
 ### Mode command (remote → VMI, type 9, byte 1 = `09`)
@@ -122,11 +127,30 @@ Boost and vacances exclude each other. Boost stops by itself after 30 minutes.
 
 Block 2 = `00 04 00 [°C]`, 20..45. The VMI answers with the filter page.
 
-## Building frames without the checksum
+## Checksum
 
-The checksum is not understood, but on the observed frames changing one field always flips
-the same bits of the raw data bytes, checksum included. The firmware therefore takes a valid
-frame heard from the remote and applies these flip masks (raw data bytes, block 1 then block 2):
+No standard CRC-8 fits, but the checksum is **XOR-linear within a frame family**: each data bit
+always flips the same bits of the checksum (78 independent checks on 110 VMI frames, no
+exception). The table differs between families (VMI pages vs commands), so it has to be worked
+out per family.
+
+For the speed command, from 30+ remote frames (7.5 to 34 °C, 33 to 97 %), as XOR on the
+**decoded** checksum byte:
+
+| Changed bit                         | Checksum flip                         |
+|-------------------------------------|---------------------------------------|
+| Temperature bits 0-5                | `21 42 84 08 31 62`                   |
+| Temperature bits 6-7 (`01` ↔ `10`)  | `4C`                                  |
+| Humidity bits 0-5                   | `31 62 C4 A9 73 E6`                   |
+| (humidity bit 6, level), offsets from (0, 2) | (0,1) `DC`, (0,3) `B4`, (1,3) `78`, (1,4) `55` |
+
+This is enough to send any room temperature and humidity a house can have. The firmware uses
+it to replace the remote's measurements by a Home Assistant probe.
+
+## Building frames from a learned frame
+
+The firmware takes a valid frame heard from the remote and applies these flip masks (raw data
+bytes, checksum included, block 1 then block 2):
 
 | Change                     | Mask                        |
 |----------------------------|-----------------------------|
@@ -147,8 +171,8 @@ Whether the masks are the same for another identifier is not known yet.
 
 ## Open questions
 
-- Checksum algorithm (would allow sending any frame, including the room temperature and
-  humidity used by the automatic mode).
+- Checksum tables for the other families (short frames, so the short speed command).
+- A counter in the type 9 reply, going down by about 122 every 10 minutes.
 - Stand-by and "summer" (glasses) indicators.
 - The meaning of the type 9 counter pages in the installer menu.
 - Filter counter reset.

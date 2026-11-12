@@ -58,6 +58,7 @@ Each block therefore carries 4 decoded bytes.
 | `08`   | Request page boost / vacances                   | page type E          |
 | `04`   | Request page filter                             | page type F          |
 | `34`   | Request page manual / automatic                 | page type A          |
+| `01`   | Reset the filter counter (filter menu)          | page type F (0 days) |
 | `24`   | Request versions (installer menu)               | page type A, sub F   |
 | `44`, `14` | Installer menu, counters                    | type 9, unknown      |
 | `x0`   | Short speed command (speed x) — checksum unknown |                     |
@@ -68,7 +69,7 @@ Each block therefore carries 4 decoded bytes.
 
 | Byte | Meaning                                                     |
 |------|-------------------------------------------------------------|
-| 0    | Relative humidity inside the unit, % (not cross-checked)    |
+| 0    | Relative humidity inside the unit, % (falls from 78 to 51 % when the air warms from 10 to 18 °C: a relative humidity) |
 | 1    | Temperature inside the unit, `(T + 40) * 2` °C              |
 | 2    | Heating set-point in °C: 0 off, 12, 15, 18; 4 = frost guard |
 | 3    | Flags: 01 / 02 seen, 80 during the installer self-test      |
@@ -96,7 +97,7 @@ Each block therefore carries 4 decoded bytes.
 |------|-----------------------------------------------------------|
 | 0    | 00 manual, 09 automatic                                   |
 | 1    | State code: 64 normal, 67 after a failed heater self-test |
-| 2    | Probably the incoming fresh air temperature, `(T + 40) * 2` °C (about 3 °C above an outdoor probe) |
+| 2    | Air temperature, `(T + 40) * 2` °C. Follows the status temperature within 0.5 °C (probably an average). On a sunny November day it read 18 °C with 11 °C outside: the duct on the roof warms the incoming air |
 | 3    | 01                                                        |
 
 Versions page (type A, sub-type F): `[VH] [VS] [nominal speed] [00]`, e.g. `20 27 01` = V2.0, V2.7, 1.
@@ -115,8 +116,12 @@ A variant with humidity 0 and level 0 is sent when leaving the installer menu.
 
 The remote sends it every 5 s while awake, on every change, on its own every 10 minutes
 (no hello before it: the VMI then takes the room values but not the speed), and every 5 to
-20 s while its temperature changes fast. When it wakes up it sends its
-own manual/automatic setting, which overrides one set by another transmitter.
+20 s while its temperature changes fast. Its periodic frames carry the speed the VMI is
+running at, so they follow a speed set by another transmitter.
+
+The remote is not needed once the frames are learned: on the reference installation the VMI ran
+16 hours with the remote's batteries out, the ESP sending the room temperature and humidity every
+10 minutes, with no fault (state code 64) and speed commands accepted.
 
 ### Mode command (remote → VMI, type 9, byte 1 = `09`)
 
@@ -169,10 +174,16 @@ bytes, checksum included, block 1 then block 2):
 All the commands built this way were accepted by the VMI on the reference installation.
 Whether the masks are the same for another identifier is not known yet.
 
+## Counters
+
+The type 9 reply that the remote asks for after each wake-up cycle carries a counter (bytes 2-3
+of block 2) going down by about 122 every 10 minutes. Extrapolated to zero, it predicted the
+next operating-day step to within a few minutes (1346 days at 10:43, expected 10:30-10:50).
+The operating-days and filter-days counters both step about every 24 h 15 min rather than 24 h.
+
 ## Open questions
 
 - Checksum tables for the other families (short frames, so the short speed command).
-- A counter in the type 9 reply, going down by about 122 every 10 minutes.
 - Stand-by and "summer" (glasses) indicators.
 - The meaning of the type 9 counter pages in the installer menu.
-- Filter counter reset.
+- Frost guard (4 °C) command.

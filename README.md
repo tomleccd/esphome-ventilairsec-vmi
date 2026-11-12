@@ -17,10 +17,11 @@ ESP32 and a CC1101 868 MHz radio. The radio protocol is documented in [PROTOCOL.
 - Préchauffage : arrêt, 12, 15 ou 18 °C
 - Boost 30 min, vacances, surventilation été, turbochauffe hiver
 - Température max (seuil de mise en veille), 20 à 45 °C
+- Remise à zéro du compteur de filtre (bouton dans la section Configuration)
 
 **Mesures relevées sur la VMI** (actualisées chaque minute)
 - Vitesse réelle, consigne de chauffage réelle, pilotage réel, modes actifs
-- Température et humidité dans la VMI, puissance de chauffage
+- Température et humidité dans la VMI, température de l'air (moyenne), puissance de chauffage
 - Jours d'utilisation du filtre, durée de fonctionnement, température max
 - Code d'état (64 = normal), utile pour une alerte de défaut
 
@@ -30,7 +31,8 @@ ESP32 and a CC1101 868 MHz radio. The radio protocol is documented in [PROTOCOL.
 à la VMI les mesures d'une sonde Home Assistant à la place de celles de la télécommande. Utile en
 pilotage automatique, quand la télécommande n'est pas dans la pièce de vie. Indiquez la sonde dans
 les substitutions `room_temp_entity` et `room_hum_entity`, puis activez l'interrupteur
-« Remplacer la telecommande (temp hum) ».
+« Remplacer la telecommande (temp hum) ». Une fois l'apprentissage fait, la télécommande peut même
+être retirée : sur l'installation de référence, la VMI a tourné 16 heures sans elle, sans défaut.
 
 ## Matériel
 
@@ -69,6 +71,9 @@ L'ESP ne connaît pas votre installation au départ et n'émet rien tant qu'il n
 3. Sur l'écran des options, activez puis désactivez un mode (le boost par exemple).
 4. Sur l'écran des consignes de température, changez la température max puis remettez-la.
 5. Le capteur **« Apprentissage etat »** doit afficher **« Complet »**. Sinon, il indique ce qui manque.
+6. Facultatif, le jour où vous changez le filtre : faites la remise à zéro depuis le menu filtre
+   de la télécommande pendant l'apprentissage. L'ESP l'apprend, et le bouton
+   « Remise a zero filtre » fonctionne ensuite depuis Home Assistant.
 
 L'ESP ne lit et ne pilote que la VMI dont il a appris l'identifiant ; les trames des voisins sont ignorées.
 
@@ -88,7 +93,7 @@ L'ESP ne lit et ne pilote que la VMI dont il a appris l'identifiant ; les trames
 
 - Les commandes sont construites à partir des trames apprises de votre télécommande et de tables
   mesurées sur une seule installation (voir [PROTOCOL.md](PROTOCOL.md)).
-- Pas encore de remise à zéro du compteur de filtre, ni des indicateurs veille et été.
+- Pas encore d'indicateurs veille et été, ni de commande hors-gel.
 
 Les retours sur d'autres installations (modèle, versions affichées dans le menu installateur,
 ce qui marche ou non) sont les bienvenus dans les *issues*.

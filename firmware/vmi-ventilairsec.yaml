@@ -88,6 +88,10 @@ globals:
     type: uint32_t
     restore_value: true
     initial_value: '0'
+  - id: l_reset              # filter counter reset (optional, learned when the remote sends it)
+    type: uint32_t
+    restore_value: true
+    initial_value: '0'
   - id: ref_frame            # last speed/heating command from the remote, 0 = not learned
     type: uint64_t
     restore_value: true
@@ -212,7 +216,7 @@ cc1101:
           // ---- address: learned from the "hello" the remote sends when it wakes up ----
           if (!is_long && d[1] == 0x06 && id(learn_switch).state && addr != id(vmi_addr)) {
             id(vmi_addr) = addr;
-            id(l_hello) = 0; id(l_req_a) = 0; id(l_req_b) = 0; id(l_req_c) = 0;
+            id(l_hello) = 0; id(l_req_a) = 0; id(l_req_b) = 0; id(l_req_c) = 0; id(l_reset) = 0;
             id(ref_frame) = 0; id(l_mode) = 0; id(l_tmax) = 0;
             ESP_LOGI("vmi", "Telecommande apprise : identifiant %04X", addr);
           }
@@ -243,8 +247,10 @@ cc1101:
             else if (d[1] == 0x08) slot = &id(l_req_a);
             else if (d[1] == 0x04) slot = &id(l_req_b);
             else if (d[1] == 0x34) slot = &id(l_req_c);
+            else if (d[1] == 0x01) slot = &id(l_reset);
             if (slot != nullptr && *slot != raw) { *slot = raw; learned = true; }
-            ESP_LOGD("vmi", "RX court %02X (%.0f dBm)", d[1], rssi);
+            if (d[1] == 0x01) ESP_LOGI("vmi", "RX remise a zero filtre (telecommande)");
+            else ESP_LOGD("vmi", "RX court %02X (%.0f dBm)", d[1], rssi);
             if (learned) id(publish_learning).execute();
             return;
           }
@@ -252,8 +258,13 @@ cc1101:
           // ================= long frames =================
           if (typ == 0xD) {
             // VMI status: [humidity %] [internal temp (T+40)*2] [heating setpoint C] [flags]
-            // Frames damaged by collisions can pass the parity check: a temperature jump of more
-            // than 5 C is only taken once a second frame confirms it.
+            // Frames damaged by collisions can pass the parity check: a relative humidity above
+            // 100 % is dropped, and a temperature jump of more than 5 C is only taken once a
+            // second frame confirms it.
+            if (e[0] > 100) {
+              ESP_LOGW("vmi", "Etat ignore (humidite %d %%)", e[0]);
+              return;
+            }
             {
               static int last_traw = -1, pending_traw = -1;
               if (last_traw >= 0 && abs(e[1] - last_traw) > 10 && e[1] != pending_traw) {
@@ -336,7 +347,8 @@ cc1101:
           }
 
           if (typ == 0xA) {
-            // Page manual / automatic: [00 manual, 09 automatic] [state code, 64 = normal] [unknown] [01]
+            // Page manual / automatic: [00 manual, 09 automatic] [state code, 64 = normal]
+            // [air temperature (T+40)*2, follows the internal temperature] [01]
             const bool is_auto = (e[0] & 0x08) != 0;
             pub_raw(3, id(vmi_raw_page_c));
             pub_num(7, id(vmi_state_code), e[1]);
@@ -360,8 +372,8 @@ cc1101:
             // [room temp (T+40)*2] [room humidity %] [00]
             // [heating 0/2/5/8 << 4 | 08 automatic | humidity level 1-4]
             pub_raw(4, id(remote_raw));
-            if (e[1] == 0) {          // variant sent when leaving the installer menu
-              ESP_LOGI("vmi", "RX commande telecommande (variante humidite 0), ignoree");
+            if (e[1] == 0 || e[1] > 100) {   // 0: variant sent when leaving the installer menu
+              ESP_LOGI("vmi", "RX commande telecommande (humidite %d %%), ignoree", e[1]);
               return;
             }
             const bool is_auto = (e[3] & 0x08) != 0;
@@ -842,10 +854,9 @@ sensor:
     accuracy_decimals: 0
   - platform: template
     id: vmi_unknown_c
-    name: "VMI temperature air entrant (supposee)"
+    name: "VMI temperature air (moyenne)"
     unit_of_measurement: "°C"
     device_class: temperature
-    entity_category: diagnostic
     state_class: measurement
     accuracy_decimals: 1
 
@@ -899,3 +910,21 @@ button:
     icon: mdi:refresh
     on_press:
       - script.execute: refresh_state
+
+  # Filter counter reset. Learned the first time the remote sends it (filter menu); the VMI
+  # answers with the filter page, which then shows 0 days.
+  - platform: template
+    name: "Remise a zero filtre"
+    icon: mdi:air-filter
+    entity_category: config
+    on_press:
+      - if:
+          condition:
+            lambda: 'return id(l_reset) == 0;'
+          then:
+            - lambda: 'id(vmi_last_cmd).publish_state("Pas encore appris (remise a zero filtre)");'
+          else:
+            - logger.log: { level: INFO, tag: vmi, format: "TX remise a zero filtre" }
+            - script.execute: { id: send_short, raw: !lambda 'return id(l_reset);' }
+            - delay: 1s
+            - script.execute: refresh_state
